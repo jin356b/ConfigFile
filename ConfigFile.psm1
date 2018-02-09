@@ -1,260 +1,320 @@
 #=================================================================================================
 # NAME       : Configuration File Module
 # AUTHOR     : Jonathon Bauer
-# DATE       : 11/1/2016
-# VERSION    : 2.0.0
+# DATE       : 11/8/2016
+# VERSION    : 2.1.0
 # DESCRIPTION: This module provides functions to read and write data from a configuration file.
 # DEPENDENCY : PowerShell v3.0 or higher.
-# FUNCTIONS  : <void> Read-ConfigVariable "VariableName" ( -Path ".\config.xml" ) ( -All ) ( -Return )
-#              <void> Write-ConfigVariable "VariableName" ( -Path ".\config.xml" )
-#              <void> Set-ConfigFile ".\config.xml" ( -NoSet )
+# FUNCTIONS  : Set-ConfigFile [-Path] <string> [-Password <string>] [-NoSet]  [<CommonParameters>]
+#              Read-Var   [[-All]] [-Path <string>] [-Password <string>] [-Return] [-Force]  [<CommonParameters>]
+#              Read-Var   [-Variable] <string> [-Path <string>] [-Password <string>] [-Return] [-Force]  [<CommonParameters>]
+#              Write-Var  [-Variable] <string> [[-Value] <Object>] [[-Path] <string>] [-NoClobber] [-EncryptDPAPI]  [<CommonParameters>]
+#              Write-Var  [-Variable] <string> [[-Value] <Object>] [[-Path] <string>] [-NoClobber] [-EncryptAES] [-Password <string>]  [<CommonParameters>]
+#              Remove-Var [-Variable] <string> [-Path <string>]  [<CommonParameters>]
 #=================================================================================================
 
 #-------------------------------
 #Module Variables
 #-------------------------------
 
-[string]$script:priv_ConfigFile = $null
+[string]$script:pConfigFile = $null
+[string]$script:pPassword = $null
 
 #-------------------------------
 #Module Functions
 #-------------------------------
 
-#Reads the the value of a variable (not case sensitive) from within the config file, and assigns it to the parent scope variable as a string.
+#Reads the the value of a variable (not case sensitive) from within the config file, and assigns it to the parent scope variable, unless -Return is used.
 #Blank lines and lines starting with '#' will be ignored from the config file.
-#Does not load the variable if an equivalent variable hasn't been declared in the script.
+#Unless -Force is used, does not load the variable if an equivalent variable hasn't been declared in the script.
 Function Read-ConfigVariable
 {
     [CmdletBinding()] 
     param(
-		[Parameter(Position=0, Mandatory=$false)]
-		[Alias("var")][String]$VarName="",        #Name of variable to read. Must be a String, and optionally contain a comma seperated list of variables.
+		[Parameter(Position=0, Mandatory=$true, ValueFromPipeline=$true, ParameterSetName="specify")]
+		[Alias("Var")][String]$Variable,          #Name of variable to read. Read multiple variables by piping an array of strings to the function.
 
-        [Parameter(Position=1, Mandatory=$false)]
- 		[Alias("file")][String]$Path,             #Optionally, specify the config file's path
+        [Parameter(Mandatory=$false)]
+ 		[Alias("File")][String]$Path,             #(Optional) The config file's path. Any previously set Config File will be temporarily ignored.
 
-        [Switch]$All,                             #Read all variables from the file
+        [Parameter(Mandatory=$false)]
+ 		[Alias("pass")][String]$Password,         #(Optional) Password to decrypt AES 256 encoded variables.
 
-        [Switch]$Return                           #Return the variable data, instead of assigning it directly to the parent variable
+        [Parameter(Position=0, ParameterSetName="all")]
+ 		[Switch]$All,                             #Read all variables from the file
+
+        [Switch]$Return,                          #Return the variable data, instead of assigning it directly to the parent variable
+
+        [Switch]$Force                            #Loads variables as strings if they're not declared in the parent script
 	)
 
-    #Validate & Format Input Parameters
-    if(!$VarName -and !$All)
+    Begin
     {
-        Throw "Unable to read variable(s). Must supply the variable name or specify -All."
-    }
-    if(!$Path -and !$script:priv_ConfigFile)
-    {
-        Throw "Unable to read variable(s). Must provide the config file's path."
-    }
-    if(!$Path)
-    {
-        $Path = $script:priv_ConfigFile
+        #Initialize Variables
+        $VarProcessed = 0
+
+        Write-Debug "[String] Path: $Path"
+        Write-Debug "[String] Password: $Password"
+        Write-Debug "[Switch] All: $All"
+        Write-Debug "[Switch] Return: $Return"
+
+        #Validate $Path Parameters
+        if($Path)
+        {
+            $Path = Set-ConfigFile $Path -NoSet
+        }
+        elseif($script:pConfigFile)
+        {
+            $Path = $script:pConfigFile
+        }
+        else
+        {
+            Throw "Unable to read variable(s). Must provide the config file's path."
+        }
+        Write-Verbose "Using config file: $Path"
+
+        #Validate & Format Input Parameters
+        if($All)
+        {
+            Write-Verbose "Reading all variables."
+        }
+        elseif($PSCmdlet.ParameterSetName -eq "specify")
+        {
+            Write-Verbose "Reading only specific variables."
+        }
+        else
+        {
+            Throw "Unable to read variable(s). Must supply the variable name(s) or specify -All."
+        }
+
+        #Load Password Data
+        if(!$Password -and $script:pPassword)
+        {
+            $Password = $script:pPassword
+            Write-Debug "[String] Password: $Password"
+        }
+
+        #Read Config File
+        $err = $false
+        Try
+        {
+            [string[]]$ConfLines = Get-Content $Path -ErrorAction Stop
+        }
+        Catch
+        {
+            Write-Debug $_.Exception.Message
+            $err = $true
+        }
+        if($err)
+        {
+            Throw "Unable to read config file: $Path"
+        }
     }
 
-    if($VarName)
+    Process
     {
-        [string[]]$VarList = $VarName.split(",")
-        [string[]]$TmpList = $null
-        foreach($Var in $VarList)
+        if(!$All)
         {
-            if($Var -match '^[a-zA-Z0-9\-_.]*$')
+            Write-Debug "[String] Variable: $Variable"
+
+            #Validate variable name
+            if($Variable -notmatch '^[a-zA-Z0-9\-_.]*$')
             {
-                $TmpList += $Var
-            }
-            else
-            {
-                Write-Verbose "The variable name `"$Var`" contains invalid characters. Ignoring."
+                Write-Warning "The variable name `$$Variable contains invalid characters."
+                Return
             }
         }
-        $VarList = $TmpList
-        Write-Verbose "Reading $($VarList.Count) variable(s)."    
-    }
-    else
-    {
-        [string[]]$VarList = $null
-        Write-Verbose "Reading all variables."
-    }
-    
-    #Ensure the config file exists
-    if(!(Test-Path $Path)) 
-    {
-        Throw "Unable to read variable(s). The config file $Path could not be found."
-    }
 
-    #Read in the config file
-    Try
-    {
-        [string[]]$lines = Get-Content -Path $Path 
-    }
-    Catch
-    {
-        Throw "Unable to read variable(s). The config file $Path could not be read."
-    }
-
-    #Parse the config file line by line
-    $rc = 0
-    $value = $null
-    foreach($line in $lines)
-    {
-        $line = $line.Trim() #Remove whitespaces
-
-        if(($line[0] -ne '#') -and ($line[0] -ne '=') -and ($line -like '*=*')) #ensure line is not a comment, and contains an equals sign
+        #Parse the config file line by line
+        $value = $null
+        $found = $false
+        foreach($line in $ConfLines)
         {
-            #Extract the variable name from the config file
-            $IsArray = $false
-            $ConfVarName = $line.Substring(0,$line.IndexOf('='))
-            if($ConfVarName.EndsWith("[]")) #Handle arrays
-            {
-                $ConfVarName = $ConfVarName.Substring(0,$ConfVarName.IndexOf('['))
-                $IsArray = $true
-            }
+            $line = $line.Trim() #Remove whitespaces
 
-            #Compare the variable name from the config file with the one we're searching for
-            if(($VarList -contains $ConfVarName) -or $All)
+            if(($line[0] -ne '#') -and ($line[0] -ne '=') -and ($line -like '*=*')) #ensure line is not a comment, and contains an equals sign
             {
-                $value = $line.Substring($line.IndexOf('=')+1) 
-                $ParentVar = Get-Variable -scope 2 -name $ConfVarName -erroraction SilentlyContinue
+                #Extract the variable name from the config file
+                $ConfVarName = $line.Substring(0,$line.IndexOf('='))
 
-                if($ParentVar -eq $null) 
+                #Handle specially formatted data
+                $type = $null
+                if($ConfVarName.EndsWith("[array]") -or $ConfVarName.EndsWith("[]")){ $type = "array" } #Include [] for backward compatibility
+                elseif($ConfVarName.EndsWith("[dpapi]")){ $type = "dpapi" }
+                elseif($ConfVarName.EndsWith("[aes256]")){ $type = "aes256" }
+
+                #Remove type data for the name
+                if($ConfVarName.Contains("["))
                 {
-                    # The Parent variable doesn't exists
-                    Write-Verbose "The variable `$$ConfVarName has not been declared yet. It will not be imported."
+                    $ConfVarName = $ConfVarName.Substring(0,$ConfVarName.IndexOf('['))
                 }
-                else 
+
+                #Compare the variable name from the config file with the one we're searching for
+                if(($Variable -eq $ConfVarName) -or $All)
                 {
-                    # Format the variable data
-                    if($IsArray) # ARRAY DATA
+                    Write-Debug "Processing variable `$$ConfVarName"
+                    $found = $true
+                    $value = $line.Substring($line.IndexOf('=')+1) 
+
+                    $err = $false
+                    Try
                     {
-                        $value = Invoke-Expression $value #Convert string into an array of variables
-                    }
-                    elseif($ParentVar.Value.GetType().Name -eq "Boolean") # BOOLEAN DATA
-                    {
-                        if($value -eq "False")
+                        $ParentVar = Get-Variable -scope 2 -name $ConfVarName -ErrorAction Stop
+                        if($ParentVar.Value -eq $null)
                         {
-                            $value = $false
-                        }
-                        else
-                        {
-                            $value = $true
+                            $err = $true
                         }
                     }
-                    else # OTHER DATA
+                    Catch
                     {
-                        $value = $value -as $ParentVar.Value.GetType() #Preserve data type
+                        Write-Debug $_.Exception.Message
+                        $err = $true
                     }
 
-                    # Output the variable
-                    if($Return)
+                    if($err -and !$Force)
                     {
-                        $value 
-                        Write-Verbose "Put data for variable $ConfVarName on the pipeline."
+                        Write-Warning "The variable `$$ConfVarName has not been declared yet. It will not be imported."
+                    }
+                    elseif($err -and $Force)
+                    {
+                        Write-Verbose "Reading variable data for `$$ConfVarName as a string."
+                        $ParentVarType = [string]
+                        $err = $false
                     }
                     else
                     {
-                        Set-Variable -scope 2 -Name $ConfVarName -Value $value #Set parent variable
-                        Write-Verbose "Updating $ConfVarName with data from config file."
+                        Write-Verbose "Pulling data type for `$$ConfVarName from the parent script."      
+                        $ParentVarType = $ParentVar.Value.GetType() #Preserve data type
                     }
 
-                    $rc++ #Increment read counter    
+                    if(!$err) #Used to skip an iteration when an error occurs and -All is set
+                    {
+                        # Format the variable data
+                        if($type -eq "array") # ARRAY DATA
+                        {
+                            $value = Invoke-Expression $value #Convert string into an array of variables
+                        }
+                        elseif($ParentVarType.Name -eq "Boolean") # BOOLEAN DATA
+                        {
+                            if($value -eq "False")
+                            {
+                                $value = $false
+                            }
+                            else
+                            {
+                                $value = $true
+                            }
+                        }
+                        elseif($ParentVarType.Name -eq "String") # STRING DATA
+                        {
+                            if($type -eq "dpapi") #Read DPAPI encrypted string
+                            {
+                                $err=$false
+                                Try
+                                {
+                                    [byte[]]$hashbytes = [System.Convert]::FromBase64String($value) #Convert Base64 to byte array
+                                    $value = ([System.BitConverter]::ToString($hashbytes)).replace('-','') #Convert byte array to hex string
+                                    $SecureStr = ConvertTo-SecureString -String $value.Trim() -ErrorAction Stop
+                                    $value = (New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList "user", $SecureStr -ErrorAction Stop).GetNetworkCredential().Password 
+                                }
+                                Catch
+                                {
+                                    Write-Debug $_.Exception.Message
+                                    $err=$true
+                                    Write-Warning "Unable to decrypt `$$ConfVarName using Windows DPAPI."
+                                }
+                            }
+                            elseif($type -eq "aes256") #Read AES256 encrypted string
+                            {
+                                if(!$Password) #Verify the password was specified
+                                {
+                                    Write-Warning "The -Password parameter was not specified. Unable to decrypt `$$ConfVarName using 256-bit AES."
+                                    $err=$true
+                                }
+                                else
+                                {
+                                    $err=$false
+                                    Try
+                                    {
+                                        $AEScsp = New-Object System.Security.Cryptography.AesCryptoServiceProvider
+                                        $AEScsp.Key = ConvertToKey $Password
+                                        $AEScsp.IV = $AEScsp.Key[8..23]
+
+                                        $inBlock = [System.Convert]::FromBase64String($Value)
+                                        $xfrm = $AEScsp.CreateDecryptor()
+                                        $outBlock = $xfrm.TransformFinalBlock($inBlock, 0, $inBlock.Length) 
+                                        $Value = [System.Text.UnicodeEncoding]::Unicode.GetString($outBlock) 
+                                    }
+                                    Catch
+                                    {
+                                        Write-Debug $_.Exception.Message
+                                        $err=$true
+                                        Write-Warning "Unable to decrypt `$$ConfVarName using 256-bit AES."
+                                    }
+                                }
+                            }
+
+                            $value = $value.replace('`n',"`n") #Handle new line chars
+                        }
+                        else # OTHER DATA
+                        {
+                            $value = $value -as $ParentVarType #Preserve data type
+                        }
+
+                        #If there were no errors formatting the value data
+                        if(!$err)
+                        {
+                            # Output the variable
+                            if($Return)
+                            {
+                                Write-Verbose "Leaving data for variable `$$ConfVarName on the pipeline."
+                                $VarProcessed++
+                                $value
+                            }
+                            else
+                            {
+                                Try
+                                {
+                                    Set-Variable -scope 2 -Name $ConfVarName -Value $value -ErrorAction Stop #Set parent variable
+                                    Write-Verbose "Updating `$$ConfVarName with data from config file."
+                                    $VarProcessed++
+                                }
+                                Catch
+                                {
+                                    Write-Debug $_.Exception.Message
+                                    Write-Warning "Unable to update `$$ConfVarName in the parent scope."
+                                }
+                            }
+                        }
+                    }
+
+                    if(!$All){ Return } #If we're not reading everything, we can move onto the next variable in the pipe
                 }
             }
         }
-    }
 
-    Write-Verbose "Successfully read $rc variable(s) from $Path."
-}
-
-Function Open-ConfigFile
-{
-    [CmdletBinding()] 
-    param(
-        [Parameter(Position=0, Mandatory=$true)]
- 		[Alias("File")][String]$Path
-	)
-
-    #Read Config File
-    $err = $false
-    Try
-    {
-        $data = Get-Content $Path
-    }
-    Catch
-    {
-        Write-Debug $_.Exception.Message
-        $err = $true
-    }
-    if($err)
-    {
-        Throw "Unable to read config file: $Path"
-    }
-
-    #Load XML Data
-    $XmlData = New-Object System.Xml.XmlDocument
-    $err = $false
-    Try
-    {
-        $XmlData.LoadXml($data)
-    }
-    Catch
-    {
-        Write-Debug $_.Exception.Message
-        $err = $true
-    }
-    if($err)
-    {
-        Throw "Unable to load XML from config file: $Path"
-    }
-
-    Return $XmlData
-}
-
-Function Resolve-DataType
-{
-    [CmdletBinding()] 
-    param(
-        [Parameter(Position=0, Mandatory=$true)]
- 		[Alias("Type")][String]$typeName
-	)
-
-###TODO: Handle arrays like System.Byte[], System.String[], etc...
-
-    $TypeSets = @(@("string","System.String"),
-                  @("int","System.Int32"),
-                  #@("array","System.Object[]"),
-                  @("bool","System.Boolean"),
-                  @("hashtable","System.Collections.Hashtable"),
-                  @("dictionary","System.Collections.Specialized.OrderedDictionary"),
-                  @("char","System.Char"),
-                  @("byte","System.Byte"),
-                  @("long","System.Int64"),
-                  @("decimal","System.Decimal"),
-                  @("single","System.Single"),
-                  @("double","System.Double"),
-                  @("datetime","System.DateTime"),
-                  @("xml","System.Xml.XmlDocument"),
-                  @("xlmnt","System.Xml.XmlElement"),
-                  @("guid","System.Guid"),
-                  @("null","null"))
-
-    if($typeName.EndsWith("[]"))
-    {
-        Return "array"
-    }
-
-    foreach($set in $TypeSets)
-    {
-        if($set[1] -eq $typeName)
+        if(!$found -and $Variable)
         {
-            Return $set[0]
+            Write-Warning "Unable to find variable `$$Variable within the config file."
         }
     }
 
-    Return $typeName
+    End
+    {
+        if($VarProcessed -gt 0)
+        {
+            Write-Verbose "Read $VarProcessed variable(s) from the config file: $Path"
+        }
+        else
+        {
+            Throw "No variables were read from the config file."
+        }
+    }
 }
 
-#Writes the specified variable to the config file. If the variable already exists, it's value is overwritten.
+#Writes the specified variable to the config file. If the variable already exists, it's value is overwritten, unless -NoClobber is used.
 #Variable names must be alphanumeric (not case sensitive), with the only allowed special characters being '.', '-', and '_'. Spaces are not allowed.
+#If a string variable contains new line characters, they will be replaced with `n in the config file.
 Function Write-ConfigVariable
 {
     [CmdletBinding()] 
@@ -266,22 +326,30 @@ Function Write-ConfigVariable
         [AllowEmptyString()]
  		[Alias("Val")]$Value,                     #(Optional) The data to assign to the new variable. If multiple variables are passed by the pipeline, this value will be assigned to all of them.
 
-        [Parameter(Mandatory=$false)]
+        [Parameter(Position=2, Mandatory=$false)]
  		[Alias("File")][String]$Path,             #(Optional) The config file's path. Any previously set Config File will be temporarily ignored.
 
- 		[Alias("NC")][Switch]$NoClobber,          #Will prevent the overwriting of variables when set. Variables are overwritten by default.
+ 		[Alias("nc")][Switch]$NoClobber,          #Will prevent the overwriting of variables when set. Variables are overwritten by default.
 
-        [Switch]$Force                            #Will update a variable's data type. Default behavior is to not update a variable if it already exists and the data type is different.
+        [Parameter(ParameterSetName="DPAPI")]
+        [Alias("dpapi")][Switch]$EncryptDPAPI,    #Will encrypt string variables with the Windows Data Protection API (DPAPI).
+
+        [Parameter(ParameterSetName="AES")]
+        [Alias("aes")][Switch]$EncryptAES,        #Will encrypt string variables with the Windows Data Protection API (DPAPI).
+
+        [Parameter(Mandatory=$false, ParameterSetName="AES")]
+ 		[Alias("pass")][String]$Password          #(Optional) Password to encrypt string variables using FIPS compliant AES 256.
 	)
 
     Begin
     {
         #Initialize Variables
         $VarProcessed = 0
-        $simpleTypes = @("string","int","byte","long","decimal","single","double","guid","bool","datetime","char","xml","xlmnt")
-        $complexTypes = @("array","hashtable","dictionary")
+        $UseParent = $false
 
         Write-Debug "[String] Path: $Path"
+        Write-Debug "[String] Password: $Password"
+        Write-Debug "[Switch] Encrypt: $Encrypt"
         Write-Debug "[Switch] NoClobbber: $NoClobber"
 
         #Validate $Path Parameters
@@ -289,9 +357,9 @@ Function Write-ConfigVariable
         {
             $Path = Set-ConfigFile $Path -NoSet
         }
-        elseif($script:priv_ConfigFile)
+        elseif($script:pConfigFile)
         {
-            $Path = $script:priv_ConfigFile
+            $Path = $script:pConfigFile
         }
         else
         {
@@ -299,11 +367,43 @@ Function Write-ConfigVariable
         }
         Write-Verbose "Using config file: $Path"
 
-        #Load XML Data
-        [xml]$XmlData = Open-ConfigFile $Path
-        $VarList = $XmlData.SelectNodes("/ConfigData/*").Name
-    }
+        #Determine value source
+        if($Value -eq $null) #value wasn't specified
+        {
+            $UseParent = $true
+        }
 
+        #Load Password Data if -Encrypt was specified
+        if($EncryptAES -and !$Password)
+        {
+            if($script:pPassword)
+            {
+                $Password = $script:pPassword
+                Write-Debug "[String] Password: $Password"
+            }
+            else
+            {
+                Throw "The -Password parameter must be specified to use AES 256 encryption."
+            }
+        }
+
+        #Read Config File
+        $err = $false
+        Try
+        {
+            [string[]]$ConfLines = Get-Content $Path
+        }
+        Catch
+        {
+            Write-Debug $_.Exception.Message -ErrorAction Stop
+            $err = $true
+        }
+        if($err)
+        {
+            Throw "Unable to read config file: $Path"
+        }
+    }
+    
     Process
     {
         Write-Debug "[String] Variable: $Variable"
@@ -315,15 +415,15 @@ Function Write-ConfigVariable
             Write-Warning "The variable name `"$Variable`" contains invalid characters."
             Return
         }
-
+        
         #Populate variable value
-        if($Value -eq $null) ##########fix to be in begin
+        if($UseParent)
         {
             Write-Verbose "Pulling `"$Variable`"'s value from the parent script."
             #Value wasn't specified, so we need to pull it from the parent scope
             Try
             {
-                $ParentVar = Get-Variable -scope 2 -name $Variable
+                $ParentVar = Get-Variable -scope 2 -name $Variable -ErrorAction Stop
             }
             Catch
             {
@@ -336,94 +436,110 @@ Function Write-ConfigVariable
             Write-Debug "[Object] Value: $Value"
         }
 
-        #Buildout Variable Template
-        $ArrayType = $null
-        Try
+        #Determine if variable is already present in config file
+        $found = $false
+        for($i=0;$i -lt $ConfLines.count;$i++)
         {
-            $VarDataType = $Value.GetType().ToString()
-        }
-        Catch
-        {
-            $VarDataType = "null"
-        }
-        $VarDataType = Resolve-DataType $VarDataType # convert to common names for known data types
-        $newNode = $XmlData.CreateElement($VarDataType)
-        $newNode.SetAttribute("name","$Variable")
+            $line = $ConfLines[$i]
+            $line = $line.Trim() #Remove whitespaces
 
-        #Determine if variable is already present
-        if($VarList -contains $Variable)
-        {
-            #Variable is present in config
-            if($NoClobber)
+            if(($line[0] -ne '#') -and ($line[0] -ne '=') -and ($line -like '*=*')) #ensure line is not a comment, and contains an equals sign
             {
-                Write-Verbose "Skipping variable `"$Variable`" because it already exists, and NoClobber is set."
-                $VarProcessed++
-                Return
-            }
-
-            #Get the exact variable case, to prevent XML matching problems
-            $Variable = $VarList[$VarList.ToLower().IndexOf($Variable.ToLower())]
-
-            #Determine data type of variable in config file
-            $node = $XmlData.SelectSingleNode("/ConfigData/*[@name=`"$Variable`"]")
-            $ConfVarDataType = $node.ToString()
+                $ConfVarName = $line.Substring(0,$line.IndexOf('='))
             
-            #Check for data type mis-match
-            if(($VarDataType -ne $ConfVarDataType) -and (!$Force)) #Data types are different and -Force isn't set
-            {
-                Write-Warning "Skipping variable `"$Variable`" because it's datatype ($VarDataType) doesn't match the config file's ($ConfVarDataType). Override using the -Force switch."
-                Return
+                if($ConfVarName.Contains("[")) #Handle type names
+                {
+                    $ConfVarName = $line.Substring(0,$line.IndexOf('['))
+                }
+                
+                if($ConfVarName -eq $Variable)
+                {
+                    $found = $true
+                    break #Preserves $i at the correct index
+                }
             }
-
-            #Reset the config variable's data
-            $XmlData.SelectSingleNode('/ConfigData').ReplaceChild($newNode, $node) > $null
         }
-        else #Variable is not present
+
+        #Skip variables that exist when -NoClobber is set
+        if($found -and $NoClobber)
         {
-            #Create the variable node
-            $XmlData.SelectSingleNode("/ConfigData").AppendChild($newNode) > $null 
+            Write-Verbose "NoClobber is enabled. Skipping $Variable because it already exists within $Path."
+            $VarProcessed++
+            Return
         }
 
-        #Write Variable Data based on data type
-        if($simpleTypes -contains $VarDataType)
+        #Construct DataType specific Value string
+        if($Value.GetType().IsArray) #ARRAY
         {
-            if($VarDataType -eq "datetime")
+            $valstring = "$Variable[array]="
+            foreach($val in $Value) #Assemble string representation of array data
             {
-                $varString = Get-date $Value -format "yyyy-MM-dd HH:mm:ss.fffffff"
+                if($val.GetType().Name -like "Int*") #Handling number data
+                {
+                    $valstring += "$val, "
+                }
+                else #Handle all other data as string
+                {
+                    $valstring += "`"$val`", "
+                }
             }
-            elseif($VarDataType -eq "char")
-            {
-                $varString = ([byte]$Value).ToString()
-            }
-            elseif(($VarDataType -eq "xml") -or ($VarDataType -eq "xlmnt"))
-            {
-                $varString = $xmlData.OuterXml
-            }
-            else
-            {
-                $varString = $Value.ToString()
-            }
-
-            $newNode.AppendChild($XmlData.CreateTextNode($varString)) > $null
-            Write-Verbose "Set `"$Variable`" to: $varString"
+            $valstring = $valstring.Substring(0,$valstring.LastIndexOf(',')) #remove final comma and space
         }
-        elseif($complexTypes -contains $VarDataType)
+        elseif($Value.GetType() -eq [string]) #STRING
         {
-            if($VarDataType -eq "array")
-            {
+            #Handle line breaks
+            $Value = $Value.Replace("`n",'`n')
 
+            if($EncryptAES) #Use AES256 encryption
+            {
+                $AEScsp = New-Object System.Security.Cryptography.AesCryptoServiceProvider
+                $AEScsp.Key = ConvertToKey $Password
+                $AEScsp.IV = $AEScsp.Key[8..23]
+            
+                $inBlock = [System.Text.UnicodeEncoding]::Unicode.getbytes($Value) 
+                $xfrm = $AEScsp.CreateEncryptor() 
+                $outBlock = $xfrm.TransformFinalBlock($inBlock, 0, $inBlock.Length) 
+                $Value = [System.Convert]::ToBase64String($outBlock)
+                                 
+                $valstring = "$Variable[aes256]=$Value"
             }
-            elseif($VarDataType -eq "hashtable")
+            elseif($EncryptDPAPI) #Use DPAPI encryption
             {
+                $SecureStr = ConvertTo-SecureString -String $Value -AsPlainText -Force #Encrypt string using DPAPI
+                $Value = ConvertFrom-SecureString -SecureString $SecureStr #Get text version of encrypted string
 
+                [byte[]]$hashbytes = $Value -split '(..)' | ? { $_ } | % { [convert]::ToByte($_,16) } #Convert hex string to byte array
+                $Value = [System.Convert]::ToBase64String($hashbytes) #Convert byte array to Base64
+
+                $valstring = "$Variable[dpapi]=$Value"
             }
-            elseif($VarDataType -eq "dictionary")
+            else #Normal Strings
             {
-
+                $valstring = "$Variable=$Value"
             }
         }
+        elseif($Value.GetType() -eq [datetime]) #DATE TIME
+        {
+            $valstring = "$Variable=$(Get-date $Value -format "yyyy-MM-dd HH:mm:ss.fffffff")"
+        }
+        else #All other data types
+        {
+            $valstring = "$Variable=$Value" 
+        }
 
-        $VarProcessed++
+        #Add new value data to $lines
+        if($found)
+        {
+            $ConfLines[$i] = $valstring #Substitute the new value
+            Write-Verbose "Overwriting $Variable within $Path."
+        }
+        else
+        {
+            $ConfLines += $valstring #Add the new value to the end
+            Write-Verbose "Adding $Variable to $Path."
+        }
+
+        $VarProcessed++ #Increment the write count
     }
 
     End
@@ -434,7 +550,7 @@ Function Write-ConfigVariable
             $err = $false
             Try
             {
-                $XmlData.Save($Path)
+                Set-Content -Path $Path -Value $ConfLines -ErrorAction Stop
             }
             Catch
             {
@@ -455,13 +571,135 @@ Function Write-ConfigVariable
     }
 }
 
+#Removes the specified variables from the config file
 Function Remove-ConfigVariable
 {
+    [CmdletBinding()] 
+    param(
+		[Parameter(Position=0, Mandatory=$true, ValueFromPipeline=$true)]
+		[Alias("Var")][String]$Variable,          #Name of variable to remove. Remove multiple variables by piping an array of strings to the function.
 
+        [Parameter(Mandatory=$false)]
+ 		[Alias("File")][String]$Path              #(Optional) The config file's path. Any previously set Config File will be temporarily ignored.
+	)
+
+    Begin
+    {
+        #Initialize Variables
+        $VarProcessed = 0
+
+        Write-Debug "[String] Path: $Path"
+
+        #Validate $Path Parameters
+        if($Path)
+        {
+            $Path = Set-ConfigFile $Path -NoSet
+        }
+        elseif($script:pConfigFile)
+        {
+            $Path = $script:pConfigFile
+        }
+        else
+        {
+            Throw "Unable to remove variable(s). Must provide the config file's path."
+        }
+        Write-Verbose "Using config file: $Path"
+
+        #Read Config File
+        $err = $false
+        Try
+        {
+            [string[]]$ConfLines = Get-Content $Path -ErrorAction Stop
+        }
+        Catch
+        {
+            Write-Debug $_.Exception.Message
+            $err = $true
+        }
+        if($err)
+        {
+            Throw "Unable to read config file: $Path"
+        }
+    }
+    
+    Process
+    {
+        Write-Debug "[String] Variable: $Variable"
+
+        #Validate variable name
+        if($Variable -notmatch '^[a-zA-Z0-9\-_.]*$')
+        {
+            Write-Warning "The variable name `"$Variable`" contains invalid characters."
+            Return
+        }
+        
+        #Copy all variables, except for the one we're removing
+        [string[]]$NewLines = @()
+        for($i=0;$i -lt $ConfLines.count;$i++)
+        {
+            $line = $ConfLines[$i]
+            $line = $line.Trim() #Remove whitespaces
+
+            if(($line[0] -ne '#') -and ($line[0] -ne '=') -and ($line -like '*=*')) #ensure line is not a comment, and contains an equals sign
+            {
+                $ConfVarName = $line.Substring(0,$line.IndexOf('='))
+            
+                if($ConfVarName.Contains("[")) #Handle special types
+                {
+                    $ConfVarName = $line.Substring(0,$line.IndexOf('['))
+                }
+                
+                if($ConfVarName -eq $Variable)
+                {
+                    Write-Verbose "Removing $Variable from $Path."
+                    $VarProcessed++ #Increment the delete count
+                }
+                else
+                {
+                    $NewLines += $ConfLines[$i]
+                }
+            }
+            else
+            {
+                $NewLines += $ConfLines[$i]
+            }
+        }
+
+        #Update main data array
+        $ConfLines = $NewLines
+    }
+
+    End
+    {
+        if($VarProcessed -gt 0)
+        {
+            #Output the new data
+            $err = $false
+            Try
+            {
+                Set-Content -Path $Path -Value $ConfLines -ErrorAction Stop
+            }
+            Catch
+            {
+                Write-Debug $_.Exception.Message
+                $err = $true
+            }
+            if($err)
+            {
+                Throw "Unable to write data back to config file: $Path"
+            }
+        
+            Write-Verbose "Removed $VarProcessed variable(s) from the config file: $Path"
+        }
+        else
+        {
+            Write-Verbose "No variables were removed from the config file."
+        }
+    }
 }
 
 
-#<void> Set-ConfigFile ".\config.xml" ( -NoSet )
+#<void> Set-ConfigFile ".\config.ini" ( -NoSet )
 Function Set-ConfigFile
 {
     [CmdletBinding()] 
@@ -469,12 +707,22 @@ Function Set-ConfigFile
 		[Parameter(Position=0, Mandatory=$true)]
 		[Alias("file")][String]$Path,             #The full or relative path to the config file.
         
+        [Parameter(Mandatory=$false)]
+ 		[Alias("pass")][String]$Password,         #(Optional) Password to decrypt AES 256 encoded variables.
+
         [Switch]$NoSet                            #The config file path is validated and initialized, but not set. Instead the full path is returned.
 	)
 
     Write-Debug "[String] Path is: $Path"
+    Write-Debug "[String] Password is: $Password"
     Write-Debug "[Switch] NoSet is: $NoSet"
-    Write-Debug "Current config file: $script:priv_ConfigFile"
+    Write-Debug "Current config file: $script:pConfigFile"
+
+    #Store password
+    if($Password)
+    {
+        $script:pPassword = $Password
+    }
 
     #Ensure config file exists, and resolve full path
     if(Test-Path $Path)
@@ -489,8 +737,8 @@ Function Set-ConfigFile
         #Create File
         Try
         {
-            New-Item -ItemType File -Path $Path -Force  > $null # Init the config file
-            $Path = (Resolve-Path $Path).ProviderPath
+            New-Item -ItemType File -Path $Path -Force -ErrorAction Stop > $null # Init the config file
+            $Path = (Resolve-Path $Path -ErrorAction Stop).ProviderPath
         }
         Catch
         {
@@ -498,26 +746,6 @@ Function Set-ConfigFile
         }
 
         Write-Verbose "Config file created at $Path"
-    }
-
-    #Validate config file format
-    $err = $false
-    Try
-    {
-        $XmlData = Open-ConfigFile $Path
-    }
-    Catch
-    {
-        $XmlData = New-Object System.Xml.XmlDocument
-        $err = $true
-    }
-
-    if($err -or !$XmlData.ConfigData)
-    {
-        #Create ConfigData element
-        Write-Verbose "Initializing root element of config file."
-        $XmlData.AppendChild($XmlData.CreateElement("ConfigData")) > $null
-        $XmlData.Save($Path)
     }
 
     #Set or return config file path
@@ -528,9 +756,18 @@ Function Set-ConfigFile
     }
     else
     {
-        $script:priv_ConfigFile = $Path
+        $script:pConfigFile = $Path
         Write-Verbose "Config file set to $Path"
     }
+}
+
+
+#Converts a string of any length to a 32-bit encryption key
+Function ConvertToKey($str)
+{
+    $SHAcsp = new-Object System.Security.Cryptography.SHA256CryptoServiceProvider
+    
+    Return $SHAcsp.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($str))
 }
 
 
