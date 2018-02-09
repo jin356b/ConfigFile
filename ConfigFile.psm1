@@ -1,13 +1,13 @@
 #=================================================================================================
 # NAME       : Configuration File Module
 # AUTHOR     : Jonathon Bauer
-# DATE       : 10/11/2016
-# VERSION    : 1.0.1
+# DATE       : 11/1/2016
+# VERSION    : 2.0.0
 # DESCRIPTION: This module provides functions to read and write data from a configuration file.
 # DEPENDENCY : PowerShell v3.0 or higher.
-# FUNCTIONS  : <void> Read-Var "VariableName" ( -Path ".\config.ini" ) ( -All ) ( -Return )
-#              <void> Write-Var "VariableName" ( -Path ".\config.ini" )
-#              <void> Set-VarFile ".\config.ini"
+# FUNCTIONS  : <void> Read-ConfigVariable "VariableName" ( -Path ".\config.xml" ) ( -All ) ( -Return )
+#              <void> Write-ConfigVariable "VariableName" ( -Path ".\config.xml" )
+#              <void> Set-ConfigFile ".\config.xml" ( -NoSet )
 #=================================================================================================
 
 #-------------------------------
@@ -23,7 +23,7 @@
 #Reads the the value of a variable (not case sensitive) from within the config file, and assigns it to the parent scope variable as a string.
 #Blank lines and lines starting with '#' will be ignored from the config file.
 #Does not load the variable if an equivalent variable hasn't been declared in the script.
-Function Read-Var
+Function Read-ConfigVariable
 {
     [CmdletBinding()] 
     param(
@@ -165,177 +165,372 @@ Function Read-Var
     Write-Verbose "Successfully read $rc variable(s) from $Path."
 }
 
-#Writes the specified variable to the config file. If the variable already exists, it's value is overwritten.
-#Variable names must be alphanumeric (not case sensitive), with the only allowed special characters being '.', '-', and '_'. Spaces are not allowed.
-#A string variable's value must not contain new line characters.
-Function Write-Var
+Function Open-ConfigFile
 {
     [CmdletBinding()] 
     param(
-		[Parameter(Position=0, Mandatory=$true)]
-		[Alias("var")][String]$VarName,           #Name of variable to write. Must be a String, and optionally contain a comma seperated list of variables.
-
-        [Parameter(Position=1, Mandatory=$false)]
- 		[Alias("file")][String]$Path              #Optionally, specify the config file's path
+        [Parameter(Position=0, Mandatory=$true)]
+ 		[Alias("File")][String]$Path
 	)
 
-    #Validate & Format Input Parameters
-    if(!$Path -and !$script:priv_ConfigFile)
+    #Read Config File
+    $err = $false
+    Try
     {
-        Throw "Unable to write variable(s). Must provide the config file's path."
+        $data = Get-Content $Path
     }
-    if(!$Path)
+    Catch
     {
-        $Path = $script:priv_ConfigFile
+        Write-Debug $_.Exception.Message
+        $err = $true
+    }
+    if($err)
+    {
+        Throw "Unable to read config file: $Path"
     }
 
-    [string[]]$VarList = $VarName.split(",")
-    [string[]]$TmpList = $null
-    foreach($Var in $VarList)
+    #Load XML Data
+    $XmlData = New-Object System.Xml.XmlDocument
+    $err = $false
+    Try
     {
-        if($Var -match '^[a-zA-Z0-9\-_.]*$')
+        $XmlData.LoadXml($data)
+    }
+    Catch
+    {
+        Write-Debug $_.Exception.Message
+        $err = $true
+    }
+    if($err)
+    {
+        Throw "Unable to load XML from config file: $Path"
+    }
+
+    Return $XmlData
+}
+
+Function Resolve-DataType
+{
+    [CmdletBinding()] 
+    param(
+        [Parameter(Position=0, Mandatory=$true)]
+ 		[Alias("Type")][String]$typeName
+	)
+
+###TODO: Handle arrays like System.Byte[], System.String[], etc...
+
+    $TypeSets = @(@("string","System.String"),
+                  @("int","System.Int32"),
+                  #@("array","System.Object[]"),
+                  @("bool","System.Boolean"),
+                  @("hashtable","System.Collections.Hashtable"),
+                  @("dictionary","System.Collections.Specialized.OrderedDictionary"),
+                  @("char","System.Char"),
+                  @("byte","System.Byte"),
+                  @("long","System.Int64"),
+                  @("decimal","System.Decimal"),
+                  @("single","System.Single"),
+                  @("double","System.Double"),
+                  @("datetime","System.DateTime"),
+                  @("xml","System.Xml.XmlDocument"),
+                  @("xlmnt","System.Xml.XmlElement"),
+                  @("guid","System.Guid"),
+                  @("null","null"))
+
+    if($typeName.EndsWith("[]"))
+    {
+        Return "array"
+    }
+
+    foreach($set in $TypeSets)
+    {
+        if($set[1] -eq $typeName)
         {
-            $TmpList += $Var
+            Return $set[0]
+        }
+    }
+
+    Return $typeName
+}
+
+#Writes the specified variable to the config file. If the variable already exists, it's value is overwritten.
+#Variable names must be alphanumeric (not case sensitive), with the only allowed special characters being '.', '-', and '_'. Spaces are not allowed.
+Function Write-ConfigVariable
+{
+    [CmdletBinding()] 
+    param(
+		[Parameter(Position=0, Mandatory=$true, ValueFromPipeline=$true)]
+		[Alias("Var")][String]$Variable,          #Name of variable to write. Write multiple variables by piping an array of strings to the function.
+
+        [Parameter(Position=1, Mandatory=$false)]
+        [AllowEmptyString()]
+ 		[Alias("Val")]$Value,                     #(Optional) The data to assign to the new variable. If multiple variables are passed by the pipeline, this value will be assigned to all of them.
+
+        [Parameter(Mandatory=$false)]
+ 		[Alias("File")][String]$Path,             #(Optional) The config file's path. Any previously set Config File will be temporarily ignored.
+
+ 		[Alias("NC")][Switch]$NoClobber,          #Will prevent the overwriting of variables when set. Variables are overwritten by default.
+
+        [Switch]$Force                            #Will update a variable's data type. Default behavior is to not update a variable if it already exists and the data type is different.
+	)
+
+    Begin
+    {
+        #Initialize Variables
+        $VarProcessed = 0
+        $simpleTypes = @("string","int","byte","long","decimal","single","double","guid","bool","datetime","char","xml","xlmnt")
+        $complexTypes = @("array","hashtable","dictionary")
+
+        Write-Debug "[String] Path: $Path"
+        Write-Debug "[Switch] NoClobbber: $NoClobber"
+
+        #Validate $Path Parameters
+        if($Path)
+        {
+            $Path = Set-ConfigFile $Path -NoSet
+        }
+        elseif($script:priv_ConfigFile)
+        {
+            $Path = $script:priv_ConfigFile
         }
         else
         {
-            Write-Verbose "The variable name `"$Var`" contains invalid characters. Ignoring."
+            Throw "Unable to write variable(s). Must provide the config file's path."
         }
-    }
-    $VarList = $TmpList
-    Write-Verbose "Writing $($VarList.Count) variable(s)."    
+        Write-Verbose "Using config file: $Path"
 
-    #Ensure the config file exists
-    if(!(Test-Path $Path)) 
+        #Load XML Data
+        [xml]$XmlData = Open-ConfigFile $Path
+        $VarList = $XmlData.SelectNodes("/ConfigData/*").Name
+    }
+
+    Process
     {
-        Write-Verbose "Config file $Path not found. Generating a new one."
-    
+        Write-Debug "[String] Variable: $Variable"
+        Write-Debug "[Object] Value: $Value"
+
+        #Validate variable name
+        if($Variable -notmatch '^[a-zA-Z0-9\-_.]*$')
+        {
+            Write-Warning "The variable name `"$Variable`" contains invalid characters."
+            Return
+        }
+
+        #Populate variable value
+        if($Value -eq $null) ##########fix to be in begin
+        {
+            Write-Verbose "Pulling `"$Variable`"'s value from the parent script."
+            #Value wasn't specified, so we need to pull it from the parent scope
+            Try
+            {
+                $ParentVar = Get-Variable -scope 2 -name $Variable
+            }
+            Catch
+            {
+                Write-Warning "No value specified, and the variable `"$Variable`" has not been declared. Skipping."
+                return
+            }
+
+            $Value = $ParentVar.Value
+
+            Write-Debug "[Object] Value: $Value"
+        }
+
+        #Buildout Variable Template
+        $ArrayType = $null
         Try
         {
-            New-Item -ItemType File -Path $Path -Force  > $null # Init the config file
+            $VarDataType = $Value.GetType().ToString()
         }
         Catch
         {
-            Throw "Unable to write variable(s). The config file $Path could not be created."
+            $VarDataType = "null"
         }
-    }
+        $VarDataType = Resolve-DataType $VarDataType # convert to common names for known data types
+        $newNode = $XmlData.CreateElement($VarDataType)
+        $newNode.SetAttribute("name","$Variable")
 
-    #Read in the config file
-    Try
-    {
-        [string[]]$lines = Get-Content -Path $Path 
-    }
-    Catch
-    {
-        Throw "Unable to write variable(s). The config file $Path could not be read."
-    }
-
-    #Loop through each variable we want to write
-    $wc = 0
-    foreach ($Var in $VarList)
-    {
-        #Get Variable's data
-        $ParentVar = Get-Variable -scope 2 -name $Var -erroraction SilentlyContinue
-        if($ParentVar -eq $null)
+        #Determine if variable is already present
+        if($VarList -contains $Variable)
         {
-            Write-Verbose "The variable `"$Var`" has not been declared. Skipping."
-            break
-        }
-        else
-        {
-            $value = $ParentVar.Value
-        }
-
-        #Handle line breaks
-        if($value.GetType() -eq [string])
-        {
-            $value = $value.Replace("`n"," ")
-        }
-
-        #Determine if variable is already present in config file
-        $found = $false
-        for($i=0;$i -lt $lines.count;$i++)
-        {
-            $line = $lines[$i]
-            $line = $line.Trim() #Remove whitespaces
-
-            if(($line[0] -ne '#') -and ($line[0] -ne '=') -and ($line -like '*=*')) #ensure line is not a comment, and contains an equals sign
+            #Variable is present in config
+            if($NoClobber)
             {
-                $ConfVarName = $line.Substring(0,$line.IndexOf('='))
+                Write-Verbose "Skipping variable `"$Variable`" because it already exists, and NoClobber is set."
+                $VarProcessed++
+                Return
+            }
+
+            #Get the exact variable case, to prevent XML matching problems
+            $Variable = $VarList[$VarList.ToLower().IndexOf($Variable.ToLower())]
+
+            #Determine data type of variable in config file
+            $node = $XmlData.SelectSingleNode("/ConfigData/*[@name=`"$Variable`"]")
+            $ConfVarDataType = $node.ToString()
             
-                if($ConfVarName.EndsWith("[]")) #Handle Array names
-                {
-                    $ConfVarName = $line.Substring(0,$line.IndexOf('['))
-                }
-                
-                if($ConfVarName -eq $Var)
-                {
-                    $found = $true
-                    break #Preserves $i at the correct index
-                }
-            }
-        }
-
-        #Construct DataType specific Value string
-        if($value.GetType().IsArray) #ARRAY
-        {
-            $valstring = "$Var[]="
-            foreach($val in $value) #Assemble string representation of array data
+            #Check for data type mis-match
+            if(($VarDataType -ne $ConfVarDataType) -and (!$Force)) #Data types are different and -Force isn't set
             {
-                if($val.GetType().Name -like "Int*") #Handling number data
-                {
-                    $valstring += "$val, "
-                }
-                else #Handle all other data as string
-                {
-                    $valstring += "`"$val`", "
-                }
+                Write-Warning "Skipping variable `"$Variable`" because it's datatype ($VarDataType) doesn't match the config file's ($ConfVarDataType). Override using the -Force switch."
+                Return
             }
-            $valstring = $valstring.Substring(0,$valstring.LastIndexOf(',')) #remove final comma and space
+
+            #Reset the config variable's data
+            $XmlData.SelectSingleNode('/ConfigData').ReplaceChild($newNode, $node) > $null
         }
-        else #All other data types
+        else #Variable is not present
         {
-            $valstring = "$Var=$value" 
+            #Create the variable node
+            $XmlData.SelectSingleNode("/ConfigData").AppendChild($newNode) > $null 
         }
 
-        #Add new value data to $lines
-        if($found)
+        #Write Variable Data based on data type
+        if($simpleTypes -contains $VarDataType)
         {
-            $lines[$i] = $valstring #Substitute the new value
-            Write-Verbose "Overwriting $Var within $Path."
+            if($VarDataType -eq "datetime")
+            {
+                $varString = Get-date $Value -format "yyyy-MM-dd HH:mm:ss.fffffff"
+            }
+            elseif($VarDataType -eq "char")
+            {
+                $varString = ([byte]$Value).ToString()
+            }
+            elseif(($VarDataType -eq "xml") -or ($VarDataType -eq "xlmnt"))
+            {
+                $varString = $xmlData.OuterXml
+            }
+            else
+            {
+                $varString = $Value.ToString()
+            }
+
+            $newNode.AppendChild($XmlData.CreateTextNode($varString)) > $null
+            Write-Verbose "Set `"$Variable`" to: $varString"
+        }
+        elseif($complexTypes -contains $VarDataType)
+        {
+            if($VarDataType -eq "array")
+            {
+
+            }
+            elseif($VarDataType -eq "hashtable")
+            {
+
+            }
+            elseif($VarDataType -eq "dictionary")
+            {
+
+            }
+        }
+
+        $VarProcessed++
+    }
+
+    End
+    {
+        if($VarProcessed -gt 0)
+        {
+            #Output the new data
+            $err = $false
+            Try
+            {
+                $XmlData.Save($Path)
+            }
+            Catch
+            {
+                Write-Debug $_.Exception.Message
+                $err = $true
+            }
+            if($err)
+            {
+                Throw "Unable to write data back to config file: $Path"
+            }
+        
+            Write-Verbose "Wrote $VarProcessed variable(s) to the config file: $Path"
         }
         else
         {
-            $lines += $valstring #Add the new value to the end
-            Write-Verbose "Adding $Var to $Path."
+            Throw "No variables were written back to the config file."
         }
-
-        $wc++ #Increment the write count
     }
-
-    #Output the new data
-    Try
-    {
-        Set-Content -Path $Path -Value $lines
-    }
-    Catch
-    {
-        Throw "Unable to write variable(s). Could not data back to the config file $Path."
-    }
-
-    Write-Verbose "Wrote $wc variable(s) to $Path."
 }
 
-#<void> Set-VarFile ".\config.ini"
-Function Set-VarFile
+Function Remove-ConfigVariable
+{
+
+}
+
+
+#<void> Set-ConfigFile ".\config.xml" ( -NoSet )
+Function Set-ConfigFile
 {
     [CmdletBinding()] 
     param(
 		[Parameter(Position=0, Mandatory=$true)]
-		[Alias("file")][String]$Path
+		[Alias("file")][String]$Path,             #The full or relative path to the config file.
+        
+        [Switch]$NoSet                            #The config file path is validated and initialized, but not set. Instead the full path is returned.
 	)
 
-    $script:priv_ConfigFile = $Path
+    Write-Debug "[String] Path is: $Path"
+    Write-Debug "[Switch] NoSet is: $NoSet"
+    Write-Debug "Current config file: $script:priv_ConfigFile"
+
+    #Ensure config file exists, and resolve full path
+    if(Test-Path $Path)
+    {
+        Write-Debug "Config file $Path already exists"
+        #Resolve Full Path
+        $Path = (Resolve-Path $Path).ProviderPath 
+    }
+    else
+    {
+        Write-Debug "Config file $Path does not exist"
+        #Create File
+        Try
+        {
+            New-Item -ItemType File -Path $Path -Force  > $null # Init the config file
+            $Path = (Resolve-Path $Path).ProviderPath
+        }
+        Catch
+        {
+            Throw "The config file $Path could not be created. $($_.Exception.Message)"
+        }
+
+        Write-Verbose "Config file created at $Path"
+    }
+
+    #Validate config file format
+    $err = $false
+    Try
+    {
+        $XmlData = Open-ConfigFile $Path
+    }
+    Catch
+    {
+        $XmlData = New-Object System.Xml.XmlDocument
+        $err = $true
+    }
+
+    if($err -or !$XmlData.ConfigData)
+    {
+        #Create ConfigData element
+        Write-Verbose "Initializing root element of config file."
+        $XmlData.AppendChild($XmlData.CreateElement("ConfigData")) > $null
+        $XmlData.Save($Path)
+    }
+
+    #Set or return config file path
+    if($NoSet)
+    {
+        Write-Verbose "Validated the config file $Path"
+        Return $Path
+    }
+    else
+    {
+        $script:priv_ConfigFile = $Path
+        Write-Verbose "Config file set to $Path"
+    }
 }
 
 
@@ -343,6 +538,12 @@ Function Set-VarFile
 #Initialize Module
 #-------------------------------
 
-$functions = 'Read-Var', 'Write-Var', 'Set-VarFile'
+New-Alias -Name 'Read-Var' -Value 'Read-ConfigVariable'
+New-Alias -Name 'Write-Var' -Value 'Write-ConfigVariable'
+New-Alias -Name 'Remove-Var' -Value 'Remove-ConfigVariable'
 
-Export-ModuleMember -Function $functions
+$aliases = 'Read-Var', 'Write-Var', 'Remove-Var'
+
+$functions = 'Read-ConfigVariable', 'Write-ConfigVariable', 'Remove-ConfigVariable', 'Set-ConfigFile'
+
+Export-ModuleMember -Function $functions -Alias $aliases
